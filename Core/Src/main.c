@@ -22,6 +22,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "door_control.h"
 
 /* USER CODE END Includes */
 
@@ -94,6 +95,10 @@ int main(void)
   MX_GPIO_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+  if (DoorControl_Start(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */

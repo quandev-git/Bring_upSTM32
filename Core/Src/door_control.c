@@ -1,5 +1,8 @@
 #include "door_control.h"
 
+#include "lcd2004.h"
+#include "pi_uart.h"
+
 /* ---------------------------------------------------------------------- */
 /*  Global RTOS objects                                                   */
 /* ---------------------------------------------------------------------- */
@@ -9,7 +12,7 @@ QueueHandle_t xSkyDoorCmdQueue   = NULL;
 QueueHandle_t xYoloResultQueue   = NULL;
 QueueHandle_t xObstructionQueue  = NULL;
 QueueHandle_t xParkingCrossingQueue = NULL;
-QueueHandle_t xProximityQueue = NULL;
+QueueHandle_t xObstacleQueue = NULL;
 QueueHandle_t xBuzzerQueue = NULL;
 QueueHandle_t xNfcEventQueue = NULL;
 SemaphoreHandle_t xParkingSlotSem   = NULL;
@@ -28,7 +31,7 @@ void DoorControl_Init(void)
     xYoloResultQueue   = xQueueCreate(4,  sizeof(yolo_result_t));
     xObstructionQueue  = xQueueCreate(4,  sizeof(obstruction_evt_t));
     xParkingCrossingQueue = xQueueCreate(4, sizeof(parking_crossing_evt_t));
-    xProximityQueue = xQueueCreate(4, sizeof(proximity_evt_t));
+    xObstacleQueue = xQueueCreate(4, sizeof(obstacle_evt_t));
     xBuzzerQueue = xQueueCreate(4, sizeof(buzzer_pattern_t));
     xNfcEventQueue = xQueueCreate(4, sizeof(nfc_evt_t));
 
@@ -52,7 +55,7 @@ void DoorControl_Init(void)
     configASSERT(xLcdQueue && xFrontDoorCmdQueue && xSkyDoorCmdQueue &&
                  xYoloResultQueue && xObstructionQueue &&
                  xParkingCrossingQueue && xParkingSlotSem &&
-                 xProximityQueue && xBuzzerQueue && xNfcEventQueue &&
+                 xObstacleQueue && xBuzzerQueue && xNfcEventQueue &&
                  frontMotor.mutex && skyMotor.mutex);
 }
 
@@ -260,463 +263,389 @@ void sky_door_execute(motor_channel_t *m, door_cmd_t cmd)
     xSemaphoreGive(m->mutex);
 }
 
-/* ---------------------------------------------------------------------- */
-/*  vTaskCurrentMonitor — highest-priority safety task                    */
-/*  Polls both BTS7960 IS pins via ADC/DMA, posts an obstruction event    */
-/*  if either channel exceeds the current limit while moving.             */
-/* ---------------------------------------------------------------------- */
-void vTaskCurrentMonitor(void *pv)
+/* One-slot application flow. The motor state machines above are retained. */
+#define DOOR_CONFIRM_WINDOW_MS 15000U
+
+typedef enum {
+    FLOW_WAIT_ENTRY = 0,
+    FLOW_WAIT_ENTRY_IR,
+    FLOW_WAIT_IR_CLEAR,
+    FLOW_WAIT_EXIT_CARD
+} flow_phase_t;
+
+typedef enum {
+    FLOW_NO_ACTION = 0,
+    FLOW_OPEN_ENTRY,
+    FLOW_COUNT_FULL,
+    FLOW_READY_EXIT,
+    FLOW_EXIT,
+    FLOW_REJECT_SAME_CARD,
+    FLOW_REJECT_IR_BLOCKED,
+    FLOW_WAIT_CAMERA,
+    FLOW_WAIT_CARD,
+    FLOW_CONFIRM_TIMEOUT
+} flow_action_t;
+
+typedef struct {
+    flow_phase_t phase;
+    uint8_t occupied;
+    bool ir_active;
+    rc522_uid_t entry_uid;
+    rc522_uid_t pending_uid;
+    bool pending_card;
+    bool pending_camera;
+    uint32_t pending_since;
+} door_flow_t;
+
+static door_flow_t active_flow;
+static SPI_HandleTypeDef active_spi2;
+static TIM_HandleTypeDef active_tim2;
+volatile door_control_status_t door_control_status = DOOR_STARTING;
+volatile uint8_t door_lcd_address7 = 0;
+volatile uint8_t door_occupied = 0;
+volatile uint32_t door_pi_detect_count = 0;
+
+static void flow_clear_pending(void)
 {
-    (void)pv;
-    TickType_t lastWake = xTaskGetTickCount();
+    active_flow.pending_card = false;
+    active_flow.pending_camera = false;
+    memset(&active_flow.pending_uid, 0, sizeof(active_flow.pending_uid));
+}
 
-    for (;;) {
-        /* TODO: replace with real ADC/DMA read of both IS pins */
-        uint16_t front_current_ma = 0; /* = ADC_ReadFrontIS(); */
-        uint16_t sky_current_ma   = 0; /* = ADC_ReadSkyIS(); */
+static flow_action_t flow_approve_entry(void)
+{
+    active_flow.entry_uid = active_flow.pending_uid;
+    active_flow.phase = FLOW_WAIT_ENTRY_IR;
+    flow_clear_pending();
+    return FLOW_OPEN_ENTRY;
+}
 
-        if (front_current_ma > CURRENT_LIMIT_MA &&
-            (frontMotor.state == DOOR_OPENING || frontMotor.state == DOOR_CLOSING)) {
-            frontMotor.state = DOOR_OBSTRUCTED;
-            obstruction_evt_t evt = { .door = DOOR_FRONT, .current_ma = front_current_ma };
-            xQueueSend(xObstructionQueue, &evt, 0);
-        }
+static flow_action_t flow_ir_changed(bool active)
+{
+    if (active_flow.ir_active == active) return FLOW_NO_ACTION;
+    active_flow.ir_active = active;
+    if (active_flow.phase == FLOW_WAIT_ENTRY_IR && active) {
+        active_flow.occupied = 1U;
+        active_flow.phase = FLOW_WAIT_IR_CLEAR;
+        return FLOW_COUNT_FULL;
+    }
+    if (active_flow.phase == FLOW_WAIT_IR_CLEAR && !active) {
+        active_flow.phase = FLOW_WAIT_EXIT_CARD;
+        return FLOW_READY_EXIT;
+    }
+    return FLOW_NO_ACTION;
+}
 
-        if (sky_current_ma > CURRENT_LIMIT_MA &&
-            (skyMotor.state == DOOR_OPENING || skyMotor.state == DOOR_CLOSING)) {
-            skyMotor.state = DOOR_OBSTRUCTED;
-            obstruction_evt_t evt = { .door = DOOR_SKY, .current_ma = sky_current_ma };
-            xQueueSend(xObstructionQueue, &evt, 0);
-        }
+static flow_action_t flow_card_seen(const rc522_uid_t *uid, uint32_t now_ms)
+{
+    if (uid == NULL || (uid->length != 4U && uid->length != 7U &&
+                        uid->length != 10U)) return FLOW_NO_ACTION;
+    if (active_flow.phase != FLOW_WAIT_ENTRY &&
+        active_flow.phase != FLOW_WAIT_EXIT_CARD) return FLOW_NO_ACTION;
+    if (active_flow.ir_active) return FLOW_REJECT_IR_BLOCKED;
 
-        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(CURRENT_SAMPLE_PERIOD_MS));
+    if (active_flow.phase == FLOW_WAIT_EXIT_CARD) {
+        if (uid->length == active_flow.entry_uid.length &&
+            memcmp(uid->bytes, active_flow.entry_uid.bytes, uid->length) == 0)
+            return FLOW_REJECT_SAME_CARD;
+        active_flow.occupied = 0U;
+        active_flow.phase = FLOW_WAIT_ENTRY;
+        memset(&active_flow.entry_uid, 0, sizeof(active_flow.entry_uid));
+        flow_clear_pending();
+        return FLOW_EXIT;
+    }
+
+    if (!active_flow.pending_card && !active_flow.pending_camera)
+        active_flow.pending_since = now_ms;
+    active_flow.pending_uid = *uid;
+    active_flow.pending_card = true;
+    if (active_flow.pending_camera) return flow_approve_entry();
+    return FLOW_WAIT_CAMERA;
+}
+
+static flow_action_t flow_car_seen(uint32_t now_ms)
+{
+    if (active_flow.phase != FLOW_WAIT_ENTRY || active_flow.ir_active)
+        return FLOW_NO_ACTION;
+    if (!active_flow.pending_card && !active_flow.pending_camera)
+        active_flow.pending_since = now_ms;
+    active_flow.pending_camera = true;
+    if (active_flow.pending_card) return flow_approve_entry();
+    return FLOW_WAIT_CARD;
+}
+
+static flow_action_t flow_check_timeout(uint32_t now_ms)
+{
+    if ((active_flow.pending_card || active_flow.pending_camera) &&
+        (uint32_t)(now_ms - active_flow.pending_since) >
+            DOOR_CONFIRM_WINDOW_MS) {
+        flow_clear_pending();
+        return FLOW_CONFIRM_TIMEOUT;
+    }
+    return FLOW_NO_ACTION;
+}
+
+static void door_queue_lcd(const char *line1, const char *line2)
+{
+    lcd_update_t message = {0};
+    strncpy(message.line1, line1, sizeof(message.line1) - 1U);
+    strncpy(message.line2, line2, sizeof(message.line2) - 1U);
+    (void)xQueueSend(xLcdQueue, &message, 0);
+}
+
+static void door_request_open(void)
+{
+    door_cmd_msg_t command = {.door = DOOR_FRONT, .cmd = CMD_OPEN};
+    (void)xQueueSend(xFrontDoorCmdQueue, &command, pdMS_TO_TICKS(50));
+}
+
+static void door_handle_action(flow_action_t action)
+{
+    switch (action) {
+    case FLOW_OPEN_ENTRY:
+        door_request_open();
+        door_queue_lcd("XE VAO 0/1", "CUA DANG MO");
+        break;
+    case FLOW_COUNT_FULL: {
+        buzzer_pattern_t beep = BUZZ_ENTRY_CONFIRM;
+        (void)xQueueSend(xBuzzerQueue, &beep, 0);
+        door_queue_lcd("XE: 1/1 - DA DAY", "CHO XE QUA IR");
+        break;
+    }
+    case FLOW_READY_EXIT:
+        door_queue_lcd("XE: 1/1 - DA DAY", "QUET THE KHAC DE RA");
+        break;
+    case FLOW_EXIT:
+        door_request_open();
+        door_queue_lcd("XE RA - XE: 0/1", "CON 1 SLOT");
+        break;
+    case FLOW_REJECT_SAME_CARD:
+        door_queue_lcd("XE: 1/1 - DA DAY", "PHAI DUNG THE KHAC");
+        break;
+    case FLOW_REJECT_IR_BLOCKED:
+        door_queue_lcd("IR DANG CO VAT", "CHUA THE MO CUA");
+        break;
+    case FLOW_WAIT_CAMERA:
+        door_queue_lcd("DA QUET THE", "CHO PI XAC NHAN XE");
+        break;
+    case FLOW_WAIT_CARD:
+        door_queue_lcd("PI DA THAY XE", "QUET THE RFID");
+        break;
+    case FLOW_CONFIRM_TIMEOUT:
+        door_queue_lcd("XE: 0/1 - CON SLOT", "QUET LAI / PI DETECT");
+        break;
+    case FLOW_NO_ACTION:
+    default:
+        break;
     }
 }
 
-/* ---------------------------------------------------------------------- */
-/*  vTaskFrontDoorControl / vTaskSkyDoorControl                           */
-/*  Owns the motor, drains its command queue, drives the state machine.   */
-/* ---------------------------------------------------------------------- */
-void vTaskFrontDoorControl(void *pv)
+void DoorControl_Tick(uint32_t now_ms)
 {
-    (void)pv;
-    door_cmd_msg_t msg;
-    door_cmd_t     latest_cmd = CMD_NONE;
+    door_handle_action(flow_check_timeout(now_ms));
+}
 
-    for (;;) {
-        if (xQueueReceive(xFrontDoorCmdQueue, &msg, pdMS_TO_TICKS(PWM_RAMP_PERIOD_MS)) == pdTRUE) {
-            if (msg.door == DOOR_FRONT) latest_cmd = msg.cmd;
-        }
-        front_door_execute(&frontMotor, latest_cmd);
-        latest_cmd = CMD_NONE; /* command consumed each tick; re-sent while held */
+void DoorControl_OnIr(bool active)
+{
+    door_handle_action(flow_ir_changed(active));
+    door_occupied = active_flow.occupied;
+}
+
+void DoorControl_OnCard(const rc522_uid_t *uid, uint32_t now_ms)
+{
+    door_control_status = DOOR_CARD_DETECTED;
+    if (frontMotor.state == DOOR_FAULT) {
+        door_queue_lcd("LOI CUA", "RESET DE TIEP TUC");
+    } else if (frontMotor.state != DOOR_IDLE_CLOSED) {
+        door_queue_lcd("CUA DANG CHAY", "CHO CUA DONG");
+    } else {
+        door_handle_action(flow_card_seen(uid, now_ms));
+        door_occupied = active_flow.occupied;
     }
 }
 
-void vTaskSkyDoorControl(void *pv)
+void DoorControl_OnCarDetected(uint32_t now_ms)
 {
-    (void)pv;
-    door_cmd_msg_t msg;
-    door_cmd_t     latest_cmd = CMD_NONE;
-
-    for (;;) {
-        if (xQueueReceive(xSkyDoorCmdQueue, &msg, pdMS_TO_TICKS(PWM_RAMP_PERIOD_MS)) == pdTRUE) {
-            if (msg.door == DOOR_SKY) latest_cmd = msg.cmd;
-        }
-        sky_door_execute(&skyMotor, latest_cmd);
-        latest_cmd = CMD_NONE;
-    }
+    ++door_pi_detect_count;
+    if (frontMotor.state == DOOR_IDLE_CLOSED)
+        door_handle_action(flow_car_seen(now_ms));
 }
 
-/* ---------------------------------------------------------------------- */
-/*  vTaskButton — EXTI-driven, debounced manual override for both doors   */
-/*  Expects an EXTI ISR to give a binary semaphore per button; poll here  */
-/*  for simplicity, swap for xSemaphoreTake(ISR_sem, portMAX_DELAY) if    */
-/*  you wire it event-driven instead.                                    */
-/* ---------------------------------------------------------------------- */
-void vTaskButton(void *pv)
+static uint16_t door_find_lcd_address(I2C_HandleTypeDef *hi2c)
 {
-    (void)pv;
-    for (;;) {
-        bool front_btn = false; /* TODO: read debounced GPIO / EXTI flag */
-        bool sky_btn   = false; /* TODO: second button or long-press disambiguation */
-
-        if (front_btn) {
-            door_cmd_msg_t m = { .door = DOOR_FRONT, .cmd = CMD_MANUAL_OVERRIDE };
-            xQueueSend(xFrontDoorCmdQueue, &m, 0);
-        }
-        if (sky_btn) {
-            door_cmd_msg_t m = { .door = DOOR_SKY, .cmd = CMD_MANUAL_OVERRIDE };
-            xQueueSend(xSkyDoorCmdQueue, &m, 0);
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
+    static const uint8_t preferred[] = {0x27U, 0x3FU};
+    for (size_t i = 0; i < sizeof(preferred); ++i) {
+        uint16_t address = (uint16_t)preferred[i] << 1;
+        if (HAL_I2C_IsDeviceReady(hi2c, address, 2, 100) == HAL_OK)
+            return address;
     }
+    for (uint8_t address7 = 0x20U; address7 <= 0x3FU; ++address7) {
+        if ((address7 > 0x27U && address7 < 0x38U) ||
+            address7 == preferred[0] || address7 == preferred[1]) continue;
+        uint16_t address = (uint16_t)address7 << 1;
+        if (HAL_I2C_IsDeviceReady(hi2c, address, 2, 100) == HAL_OK)
+            return address;
+    }
+    return 0;
 }
 
-/* ---------------------------------------------------------------------- */
-/*  Two-step verification helpers                                         */
-/* ---------------------------------------------------------------------- */
-static void confirm_entry(void)
+static void door_show_error(const char *line2)
 {
-    if (!ParkingSlots_Available()) {
-        /* Both steps were completed correctly, but the lot is full — deny
-           at the last moment. This is a real scenario: camera matched,
-           driver tapped the card, only then do we know slots ran out
-           (e.g. someone else took the last one moments earlier). */
-        lcd_update_t full = {0};
-        strncpy(full.line1, "PARKING FULL", 16);
-        strncpy(full.line2, "Please wait...", 16);
-        xQueueSend(xLcdQueue, &full, 0);
-        buzzer_pattern_t p = BUZZ_DENIED;
-        xQueueSend(xBuzzerQueue, &p, 0);
-        return;
-    }
-
-    door_cmd_msg_t m = { .door = DOOR_FRONT, .cmd = CMD_OPEN };
-    xQueueSend(xFrontDoorCmdQueue, &m, 0);
-
-    /* Direction is known from the verification order itself — no camera
-       bbox-size/direction logic needed. Slot accounting (semaphore take)
-       happens in vTaskParkingCounter when it drains this event. */
-    parking_crossing_evt_t evt = { .direction = DIR_ENTRY };
-    xQueueSend(xParkingCrossingQueue, &evt, 0);
-
-    lcd_update_t ok = {0};
-    strncpy(ok.line1, "Welcome home", 16);
-    xQueueSend(xLcdQueue, &ok, 0);
+    (void)LCD2004_Clear();
+    (void)LCD2004_SetCursor(0, 0);
+    (void)LCD2004_Print("LOI KHOI DONG");
+    (void)LCD2004_SetCursor(1, 0);
+    (void)LCD2004_Print(line2);
 }
 
-static void confirm_exit(void)
+static HAL_StatusTypeDef door_board_init(void)
 {
-    door_cmd_msg_t m = { .door = DOOR_FRONT, .cmd = CMD_OPEN };
-    xQueueSend(xFrontDoorCmdQueue, &m, 0);
+    GPIO_InitTypeDef gpio = {0};
+    TIM_OC_InitTypeDef pwm = {0};
 
-    parking_crossing_evt_t evt = { .direction = DIR_EXIT };
-    xQueueSend(xParkingCrossingQueue, &evt, 0);
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_SPI2_CLK_ENABLE();
+    __HAL_RCC_TIM2_CLK_ENABLE();
 
-    lcd_update_t ok = {0};
-    strncpy(ok.line1, "Goodbye!", 16);
-    strncpy(ok.line2, "Drive safe", 16);
-    xQueueSend(xLcdQueue, &ok, 0);
+    /* Motor bridge outputs stay disabled until PWM has started at zero. */
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2 | GPIO_PIN_3, GPIO_PIN_RESET);
+    gpio.Pin = GPIO_PIN_2 | GPIO_PIN_3;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11, GPIO_PIN_RESET);
+    gpio.Pin = GPIO_PIN_11;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    gpio.Pin = GPIO_PIN_0 | GPIO_PIN_1;
+    gpio.Mode = GPIO_MODE_AF_PP;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9 | GPIO_PIN_12, GPIO_PIN_SET);
+    gpio.Pin = GPIO_PIN_9 | GPIO_PIN_12;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    gpio.Pin = GPIO_PIN_13 | GPIO_PIN_15;
+    gpio.Mode = GPIO_MODE_AF_PP;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    gpio.Pin = GPIO_PIN_14;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    gpio.Pin = GPIO_PIN_8;
+    gpio.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    active_spi2.Instance = SPI2;
+    active_spi2.Init.Mode = SPI_MODE_MASTER;
+    active_spi2.Init.Direction = SPI_DIRECTION_2LINES;
+    active_spi2.Init.DataSize = SPI_DATASIZE_8BIT;
+    active_spi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+    active_spi2.Init.CLKPhase = SPI_PHASE_1EDGE;
+    active_spi2.Init.NSS = SPI_NSS_SOFT;
+    active_spi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+    active_spi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    active_spi2.Init.TIMode = SPI_TIMODE_DISABLE;
+    active_spi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+    active_spi2.Init.CRCPolynomial = 7;
+    if (HAL_SPI_Init(&active_spi2) != HAL_OK) return HAL_ERROR;
+
+    active_tim2.Instance = TIM2;
+    active_tim2.Init.Prescaler = 0;
+    active_tim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+    active_tim2.Init.Period = 399; /* 20 kHz at the current 8 MHz timer clock. */
+    active_tim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    active_tim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_PWM_Init(&active_tim2) != HAL_OK) return HAL_ERROR;
+
+    pwm.OCMode = TIM_OCMODE_PWM1;
+    pwm.Pulse = 0;
+    pwm.OCPolarity = TIM_OCPOLARITY_HIGH;
+    pwm.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&active_tim2, &pwm, TIM_CHANNEL_1) != HAL_OK ||
+        HAL_TIM_PWM_ConfigChannel(&active_tim2, &pwm, TIM_CHANNEL_2) != HAL_OK)
+        return HAL_ERROR;
+    return HAL_OK;
 }
 
-/* ---------------------------------------------------------------------- */
-/*  vTaskAccessControl — front-door two-step verification                 */
-/*                                                                        */
-/*  ENTRY: camera matches the car first, then the driver taps the NFC     */
-/*         card within TWO_STEP_TIMEOUT_MS.                               */
-/*  EXIT:  the driver taps the card first, then the camera confirms the   */
-/*         car within the same window.                                    */
-/*  The ORDER the two events arrive in is what tells us the direction —   */
-/*  this replaces needing the camera to infer entry/exit from bbox size.  */
-/*  Manual button always wins immediately and cancels any pending         */
-/*  half-completed sequence.                                              */
-/* ---------------------------------------------------------------------- */
-void vTaskAccessControl(void *pv)
+HAL_StatusTypeDef DoorControl_Start(I2C_HandleTypeDef *hi2c)
 {
-    (void)pv;
-    verify_state_t state = VERIFY_IDLE;
-    TickType_t     pending_since = 0;
-    yolo_result_t  yolo;
-    nfc_evt_t      nfc;
+    door_control_status = DOOR_STARTING;
+    door_lcd_address7 = 0;
+    door_occupied = 0;
+    door_pi_detect_count = 0;
+    memset(&active_flow, 0, sizeof(active_flow));
 
-    for (;;) {
-        bool button_evt = false; /* TODO: shared flag/queue from vTaskButton */
-        bool cam_event = (xQueueReceive(xYoloResultQueue, &yolo, 0) == pdTRUE) && yolo.match;
-        bool nfc_event = (xQueueReceive(xNfcEventQueue, &nfc, 0) == pdTRUE) && nfc.valid;
-
-        if (button_evt) {
-            /* Manual override always wins and clears any stale
-               half-verification so it can't leak into the next attempt. */
-            state = VERIFY_IDLE;
-            door_cmd_msg_t m = { .door = DOOR_FRONT, .cmd = CMD_MANUAL_OVERRIDE };
-            xQueueSend(xFrontDoorCmdQueue, &m, 0);
-        }
-
-        if (state != VERIFY_IDLE &&
-            (xTaskGetTickCount() - pending_since) > pdMS_TO_TICKS(TWO_STEP_TIMEOUT_MS)) {
-            lcd_update_t warn = {0};
-            strncpy(warn.line1, "VERIFY TIMEOUT", 16);
-            strncpy(warn.line2,
-                    state == VERIFY_CAM_PENDING ? "No card tapped" : "No cam confirm",
-                    16);
-            xQueueSend(xLcdQueue, &warn, 0);
-            state = VERIFY_IDLE;
-        }
-
-        switch (state) {
-        case VERIFY_IDLE:
-            if (cam_event) {
-                state = VERIFY_CAM_PENDING;
-                pending_since = xTaskGetTickCount();
-                lcd_update_t upd = {0};
-                strncpy(upd.line1, "Car recognized", 16);
-                strncpy(upd.line2, "Tap card to enter", 16);
-                xQueueSend(xLcdQueue, &upd, 0);
-            } else if (nfc_event) {
-                state = VERIFY_NFC_PENDING;
-                pending_since = xTaskGetTickCount();
-                lcd_update_t upd = {0};
-                strncpy(upd.line1, "Card accepted", 16);
-                strncpy(upd.line2, "Confirming exit", 16);
-                xQueueSend(xLcdQueue, &upd, 0);
-            }
-            break;
-
-        case VERIFY_CAM_PENDING:
-            if (nfc_event) {
-                confirm_entry();
-                state = VERIFY_IDLE;
-            } else if (cam_event) {
-                pending_since = xTaskGetTickCount(); /* car still in frame — refresh window */
-            }
-            break;
-
-        case VERIFY_NFC_PENDING:
-            if (cam_event) {
-                confirm_exit();
-                state = VERIFY_IDLE;
-            } else if (nfc_event) {
-                pending_since = xTaskGetTickCount();
-            }
-            break;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(50));
+    if (hi2c == NULL || door_board_init() != HAL_OK) {
+        door_control_status = DOOR_BOARD_ERROR;
+        return HAL_ERROR;
     }
-}
-
-/* ---------------------------------------------------------------------- */
-/*  vTaskSkyDoorLogic — rain-driven arbitration, independent of front     */
-/* ---------------------------------------------------------------------- */
-void vTaskSkyDoorLogic(void *pv)
-{
-    (void)pv;
-    for (;;) {
-        bool button_evt    = false; /* handled separately via vTaskButton if you wire it */
-        bool rain_detected = false; /* TODO: shared flag from vTaskRainSensor */
-
-        door_cmd_t cmd = sky_arbitrate(button_evt, rain_detected);
-        if (cmd != CMD_NONE) {
-            door_cmd_msg_t m = { .door = DOOR_SKY, .cmd = cmd };
-            xQueueSend(xSkyDoorCmdQueue, &m, 0);
-        }
-        vTaskDelay(pdMS_TO_TICKS(500));
+    uint16_t lcd_address = door_find_lcd_address(hi2c);
+    if (lcd_address == 0U) {
+        door_control_status = DOOR_LCD_NOT_FOUND;
+        return HAL_ERROR;
     }
-}
-
-/* ---------------------------------------------------------------------- */
-/*  vTaskLCD — single owner of the display, drains a queue                */
-/* ---------------------------------------------------------------------- */
-void vTaskLCD(void *pv)
-{
-    (void)pv;
-    lcd_update_t upd;
-    for (;;) {
-        if (xQueueReceive(xLcdQueue, &upd, portMAX_DELAY) == pdTRUE) {
-            /* TODO: replace with your lcd1602/lcd2004 driver calls */
-            /* LCD_SetCursor(0,0); LCD_Print(upd.line1);
-               LCD_SetCursor(1,0); LCD_Print(upd.line2); */
-        }
+    door_lcd_address7 = (uint8_t)(lcd_address >> 1);
+    if (LCD2004_Init(hi2c, lcd_address) != HAL_OK) {
+        door_control_status = DOOR_LCD_ERROR;
+        return HAL_ERROR;
     }
-}
-
-/* ---------------------------------------------------------------------- */
-/*  Remaining tasks — skeletons only, fill in per your peripheral drivers */
-/* ---------------------------------------------------------------------- */
-void vTaskNFCRead(void *pv)
-{
-    (void)pv;
-    for (;;) {
-        /* TODO: poll NFC reader. On each NEW valid card presented (edge —
-           don't re-fire every poll while the same card sits on the
-           reader), validate UID against the whitelist and push exactly
-           one event:
-             nfc_evt_t evt = { .valid = true };
-             xQueueSend(xNfcEventQueue, &evt, 0);
-           vTaskAccessControl treats this as one swipe. Debounce/edge
-           detection belongs here, not in the FSM. */
-        vTaskDelay(pdMS_TO_TICKS(100));
+    (void)LCD2004_SetCursor(0, 0);
+    (void)LCD2004_Print("DANG KHOI DONG");
+    if (RC522_Init(&active_spi2) != HAL_OK) {
+        door_control_status = DOOR_RC522_ERROR;
+        door_show_error("KIEM TRA RC522 SPI2");
+        return HAL_ERROR;
     }
-}
 
-void vTaskUART_Pi(void *pv)
-{
-    (void)pv;
-    for (;;) {
-        /* TODO: receive framed UART message from Pi4, parse into
-           yolo_result_t, xQueueSend(xYoloResultQueue, &result, 0); */
-        vTaskDelay(pdMS_TO_TICKS(20));
+    xFrontDoorCmdQueue = xQueueCreate(4, sizeof(door_cmd_msg_t));
+    xLcdQueue = xQueueCreate(4, sizeof(lcd_update_t));
+    xBuzzerQueue = xQueueCreate(2, sizeof(buzzer_pattern_t));
+    xYoloResultQueue = xQueueCreate(4, sizeof(yolo_result_t));
+    frontMotor.mutex = xSemaphoreCreateMutex();
+    if (!xFrontDoorCmdQueue || !xLcdQueue || !xBuzzerQueue ||
+        !xYoloResultQueue || !frontMotor.mutex) {
+        door_control_status = DOOR_RTOS_ERROR;
+        door_show_error("THIEU BO NHO RTOS");
+        return HAL_ERROR;
     }
-}
-
-void vTaskRainSensor(void *pv)
-{
-    (void)pv;
-    for (;;) {
-        /* TODO: read rain sensor GPIO/ADC, update shared flag for
-           vTaskSkyDoorLogic */
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    if (PiUart_Init() != HAL_OK) {
+        door_control_status = DOOR_UART_ERROR;
+        door_show_error("KIEM TRA USART1");
+        return HAL_ERROR;
     }
-}
 
-void vTaskParkingCounter(void *pv)
-{
-    (void)pv;
-    parking_crossing_evt_t evt;
+    frontMotor.id = DOOR_FRONT;
+    frontMotor.state = DOOR_IDLE_CLOSED;
+    frontMotor.pwm_timer = &active_tim2;
+    frontMotor.pwm_channel_fwd = TIM_CHANNEL_1;
+    frontMotor.pwm_channel_rev = TIM_CHANNEL_2;
+    frontMotor.en_port = GPIOA;
+    frontMotor.en_pin = GPIO_PIN_2 | GPIO_PIN_3;
+    frontMotor.current_duty = 0;
 
-    for (;;) {
-        /* Blocks until Pi4 (via vTaskUART_Pi) reports a confirmed crossing.
-           This is deliberately a SEPARATE event from EVT_CAR_MATCH: match
-           only means "authorized to enter", fired on approach. Crossing
-           means the car actually passed the gate line — that's the only
-           thing that should move the counter, so a car that gets access
-           but backs out never gets counted. Direction detection itself is
-           Pi4-side work (e.g. tracking bounding-box motion across a virtual
-           line in the frame, or two beam sensors) — out of scope here. */
-        if (xQueueReceive(xParkingCrossingQueue, &evt, portMAX_DELAY) == pdTRUE) {
-
-            if (evt.direction == DIR_ENTRY) {
-                if (xSemaphoreTake(xParkingSlotSem, 0) != pdTRUE) {
-                    /* Semaphore already at 0 — an entry was confirmed while
-                       we had no free slot on record. Should not happen if
-                       the full-lot gate above is working; treat as a
-                       miscount/anomaly and flag it rather than silently
-                       going negative (counting semaphore can't go negative
-                       anyway — this branch just means we dropped the
-                       event). Log it. */
-                    lcd_update_t err = {0};
-                    strncpy(err.line1, "COUNT ERROR", 16);
-                    strncpy(err.line2, "Entry w/ 0 free", 16);
-                    xQueueSend(xLcdQueue, &err, 0);
-                }
-            } else { /* DIR_EXIT */
-                if (xSemaphoreGive(xParkingSlotSem) != pdTRUE) {
-                    /* Give failed => already at MAX_PARK_SLOTS. Means an
-                       exit was double-reported, or an earlier entry was
-                       never counted. Also an anomaly worth surfacing. */
-                    lcd_update_t err = {0};
-                    strncpy(err.line1, "COUNT ERROR", 16);
-                    strncpy(err.line2, "Exit w/ lot full", 16);
-                    xQueueSend(xLcdQueue, &err, 0);
-                }
-            }
-
-            lcd_update_t upd = {0};
-            snprintf(upd.line1, sizeof(upd.line1), "Slots: %u/%u",
-                      ParkingSlots_Count(), MAX_PARK_SLOTS);
-            strncpy(upd.line2, ParkingSlots_Available() ? "" : "LOT FULL", 16);
-            xQueueSend(xLcdQueue, &upd, 0);
-        }
+    if (xTaskCreate(vTaskNFCRead, "EntryFlow", 384, NULL, 2, NULL) != pdPASS ||
+        xTaskCreate(vTaskFrontDoorControl, "FrontMotor", 256, NULL, 3, NULL) != pdPASS ||
+        xTaskCreate(vTaskLCD, "LCD2004", 256, NULL, 1, NULL) != pdPASS ||
+        xTaskCreate(vTaskBuzzer, "Buzzer", 128, NULL, 1, NULL) != pdPASS ||
+        xTaskCreate(vTaskUART_Pi, "PiUART", 192, NULL, 2, NULL) != pdPASS) {
+        door_control_status = DOOR_RTOS_ERROR;
+        door_show_error("KHONG TAO DUOC TASK");
+        return HAL_ERROR;
     }
-}
-
-void vTaskParkAssist(void *pv)
-{
-    (void)pv;
-    TickType_t lastWake = xTaskGetTickCount();
-    buzzer_pattern_t last_sent = BUZZ_NONE;
-
-    for (;;) {
-        /* TODO: replace with real ultrasonic read (HC-SR04 style: trigger
-           pulse + echo pulse-width capture via TIM input capture, or a
-           ToF/IR module). This task is independent of door motor current
-           sensing — it watches the CAR's distance to a wall/object in the
-           stall while reversing, not the door mechanism. */
-        uint16_t distance_cm = 0xFFFF; /* = UltrasonicRead(); placeholder = "far/no reading" */
-
-        buzzer_pattern_t pattern;
-        if (distance_cm > PARK_ASSIST_SAFE_CM) {
-            pattern = BUZZ_NONE;
-        } else if (distance_cm > PARK_ASSIST_WARN_CM) {
-            pattern = BUZZ_NONE; /* within safe zone but not yet warn threshold */
-        } else if (distance_cm > PARK_ASSIST_CRITICAL_CM) {
-            pattern = BUZZ_SLOW;
-        } else {
-            pattern = BUZZ_CONTINUOUS;
-        }
-
-        /* only post when it changes — avoid spamming the buzzer queue every
-           80ms with the same pattern */
-        if (pattern != last_sent) {
-            xQueueSend(xBuzzerQueue, &pattern, 0);
-            last_sent = pattern;
-        }
-
-        proximity_evt_t evt = { .distance_cm = distance_cm };
-        xQueueSend(xProximityQueue, &evt, 0); /* for logging/LCD if desired */
-
-        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(PARK_ASSIST_SAMPLE_MS));
+    if (HAL_TIM_PWM_Start(&active_tim2, TIM_CHANNEL_1) != HAL_OK ||
+        HAL_TIM_PWM_Start(&active_tim2, TIM_CHANNEL_2) != HAL_OK) {
+        door_control_status = DOOR_PWM_ERROR;
+        door_show_error("KIEM TRA TIM2 PWM");
+        return HAL_ERROR;
     }
-}
-
-void vTaskBuzzer(void *pv)
-{
-    (void)pv;
-    buzzer_pattern_t pattern = BUZZ_NONE;
-
-    for (;;) {
-        /* Block until a new pattern arrives, but also re-check periodically
-           so continuous/slow patterns keep beeping without needing a new
-           queue message each cycle. */
-        xQueueReceive(xBuzzerQueue, &pattern, pdMS_TO_TICKS(50));
-
-        switch (pattern) {
-        case BUZZ_NONE:
-            /* TODO: HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET); */
-            vTaskDelay(pdMS_TO_TICKS(50));
-            break;
-
-        case BUZZ_SLOW:
-            /* TODO: buzzer ON */
-            vTaskDelay(pdMS_TO_TICKS(80));
-            /* TODO: buzzer OFF */
-            vTaskDelay(pdMS_TO_TICKS(400));
-            break;
-
-        case BUZZ_FAST:
-            /* TODO: buzzer ON */
-            vTaskDelay(pdMS_TO_TICKS(80));
-            /* TODO: buzzer OFF */
-            vTaskDelay(pdMS_TO_TICKS(120));
-            break;
-
-        case BUZZ_CONTINUOUS:
-            /* TODO: buzzer ON, held */
-            vTaskDelay(pdMS_TO_TICKS(50));
-            break;
-
-        case BUZZ_DENIED:
-            /* one long beep, then drop back to NONE */
-            /* TODO: buzzer ON */
-            vTaskDelay(pdMS_TO_TICKS(500));
-            /* TODO: buzzer OFF */
-            pattern = BUZZ_NONE;
-            break;
-
-        case BUZZ_ACCESS_MISMATCH:
-            /* short distinct double-beep, then drop back to NONE */
-            for (int i = 0; i < 2; i++) {
-                /* TODO: buzzer ON */
-                vTaskDelay(pdMS_TO_TICKS(100));
-                /* TODO: buzzer OFF */
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-            pattern = BUZZ_NONE;
-            break;
-
-        default:
-            pattern = BUZZ_NONE;
-            break;
-        }
-    }
-}
-
-void vTaskWatchdog(void *pv)
-{
-    (void)pv;
-    for (;;) {
-        /* TODO: check per-task heartbeat timestamps, HAL_IWDG_Refresh()
-           only if all tasks are healthy */
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2 | GPIO_PIN_3, GPIO_PIN_SET);
+    door_control_status = DOOR_READY;
+    return HAL_OK;
 }

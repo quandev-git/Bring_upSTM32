@@ -7,6 +7,7 @@
 #include "semphr.h"
 #include "stm32f1xx_hal.h"
 #include "stm32f1xx_hal_tim.h"
+#include "rc522.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -22,11 +23,9 @@
 #define PWM_MAX_DUTY              100U
 #define DOOR_TRAVEL_TIMEOUT_MS    8000U   /* safety: max time to open/close */
 
-/* Park-assist ultrasonic thresholds, in cm — tune to your stall depth */
-#define PARK_ASSIST_SAFE_CM       100U   /* > this: silent */
-#define PARK_ASSIST_WARN_CM        50U   /* between WARN and CRITICAL: slow beep */
-#define PARK_ASSIST_CRITICAL_CM    20U   /* < this: fast/continuous beep */
-#define PARK_ASSIST_SAMPLE_MS       80U
+/* Digital IR obstacle sensor on PB8. Set the active level for your module. */
+#define IR_OBSTACLE_SAMPLE_MS      20U
+#define IR_OBSTACLE_ACTIVE_STATE   GPIO_PIN_RESET
 
 #define MAX_PARK_SLOTS            3U
 
@@ -70,8 +69,8 @@ typedef enum {
 /*  Messages passed between tasks                                        */
 /* ---------------------------------------------------------------------- */
 typedef struct {
-    char line1[17];
-    char line2[17];
+    char line1[21];
+    char line2[21];
 } lcd_update_t;
 
 typedef struct {
@@ -105,12 +104,10 @@ typedef struct {
     crossing_dir_t direction;
 } parking_crossing_evt_t;
 
-/* Ultrasonic reading at the parking stall — independent of door motor
-   current sensing. This watches for the CAR getting too close to a wall/
-   object while reversing in, not the door mechanism itself. */
+/* Digital IR sensor reports an obstacle, not a distance. */
 typedef struct {
-    uint16_t distance_cm;
-} proximity_evt_t;
+    bool detected;
+} obstacle_evt_t;
 
 typedef enum {
     BUZZ_NONE = 0,
@@ -121,11 +118,11 @@ typedef enum {
     BUZZ_DENIED             /* e.g. lot full — single long beep */
 } buzzer_pattern_t;
 
-/* Two-step verification state machine (front door only).
-   ENTRY  = camera match first, then NFC swipe within the timeout window.
-   EXIT   = NFC swipe first, then camera confirm within the timeout window.
-   The ORDER of the two events is what tells us the direction — no bbox
-   size/direction logic needed on the Pi4 side anymore. */
+/* Reuse the short pulse pattern for confirmed entry. */
+#define BUZZ_ENTRY_CONFIRM BUZZ_SLOW
+
+/* Legacy two-step verification state used by the optional access-control
+   task. The active one-slot flow is owned by door_control.c. */
 typedef enum {
     VERIFY_IDLE = 0,
     VERIFY_CAM_PENDING,   /* camera matched, waiting for NFC -> entry attempt */
@@ -165,7 +162,7 @@ extern QueueHandle_t xSkyDoorCmdQueue;
 extern QueueHandle_t xYoloResultQueue;
 extern QueueHandle_t xObstructionQueue;
 extern QueueHandle_t xParkingCrossingQueue;
-extern QueueHandle_t xProximityQueue;
+extern QueueHandle_t xObstacleQueue;
 extern QueueHandle_t xBuzzerQueue;
 extern QueueHandle_t xNfcEventQueue;
 extern SemaphoreHandle_t xParkingSlotSem;   /* counting semaphore, 0..MAX_PARK_SLOTS free slots */
@@ -177,6 +174,32 @@ extern motor_channel_t skyMotor;
 /*  Public API                                                            */
 /* ---------------------------------------------------------------------- */
 void DoorControl_Init(void);
+
+/* Active one-slot application. The legacy DoorControl_Init() above remains
+   available for the older, larger task set. */
+HAL_StatusTypeDef DoorControl_Start(I2C_HandleTypeDef *hi2c);
+void DoorControl_Tick(uint32_t now_ms);
+void DoorControl_OnIr(bool active);
+void DoorControl_OnCard(const rc522_uid_t *uid, uint32_t now_ms);
+void DoorControl_OnCarDetected(uint32_t now_ms);
+
+typedef enum {
+    DOOR_STARTING = 0,
+    DOOR_BOARD_ERROR,
+    DOOR_LCD_NOT_FOUND,
+    DOOR_LCD_ERROR,
+    DOOR_RC522_ERROR,
+    DOOR_RTOS_ERROR,
+    DOOR_PWM_ERROR,
+    DOOR_READY,
+    DOOR_CARD_DETECTED,
+    DOOR_UART_ERROR
+} door_control_status_t;
+
+extern volatile door_control_status_t door_control_status;
+extern volatile uint8_t door_lcd_address7;
+extern volatile uint8_t door_occupied;
+extern volatile uint32_t door_pi_detect_count;
 
 /* Arbitration */
 door_cmd_t sky_arbitrate(bool button_evt, bool rain_detected);
@@ -200,7 +223,7 @@ void vTaskAccessControl(void *pv);
 void vTaskRainSensor(void *pv);
 void vTaskSkyDoorLogic(void *pv);
 void vTaskParkingCounter(void *pv);
-void vTaskParkAssist(void *pv);
+void vTaskIRObstacle(void *pv);
 void vTaskLCD(void *pv);
 void vTaskBuzzer(void *pv);
 void vTaskWatchdog(void *pv);
